@@ -35,7 +35,7 @@ grpc = ["dep:tonic", "dep:prost", "dep:prost-types"]
 # Message models.
 cloud_events = ["dep:cloudevents"]
 # TLS support.
-tls = ["tonic/tls"]
+tls = ["tonic/tls", "tonic/tls-native-roots"]
 # Convenience aggregate (only enabled features; add http/tcp as they land).
 full = ["grpc", "cloud_events", "tls"]
 # End-to-end tests (tests/e2e/*). Gated off by default so plain `cargo test`

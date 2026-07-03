@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::config::ClientIdentity;
+use crate::config::{ClientIdentity, TlsConfig};
 
 /// Default gRPC port of an EventMesh runtime.
 pub const DEFAULT_GRPC_PORT: u16 = 10_205;
@@ -35,6 +35,10 @@ pub struct GrpcClientConfig {
     pub server_port: u16,
     /// Whether to use TLS (`https`).
     pub use_tls: bool,
+    /// TLS details (CA cert, client identity, SNI, ...). Applied only when
+    /// `use_tls` is `true` and the `tls` cargo feature is enabled. If `None`,
+    /// tonic uses its built-in defaults.
+    pub tls_config: Option<TlsConfig>,
     /// Default RPC timeout applied when none is given to a call.
     pub timeout: Duration,
     /// Client identity sent with every request.
@@ -47,6 +51,7 @@ impl Default for GrpcClientConfig {
             server_addr: "localhost".into(),
             server_port: DEFAULT_GRPC_PORT,
             use_tls: false,
+            tls_config: None,
             timeout: DEFAULT_TIMEOUT,
             identity: ClientIdentity::detect(),
         }
@@ -71,6 +76,7 @@ pub struct GrpcClientConfigBuilder {
     server_addr: Option<String>,
     server_port: Option<u16>,
     use_tls: Option<bool>,
+    tls_config: Option<TlsConfig>,
     timeout: Option<Duration>,
     identity: Option<ClientIdentity>,
     // identity convenience setters:
@@ -95,6 +101,10 @@ impl GrpcClientConfigBuilder {
     }
     pub fn use_tls(mut self, v: bool) -> Self {
         self.use_tls = Some(v);
+        self
+    }
+    pub fn tls_config(mut self, v: TlsConfig) -> Self {
+        self.tls_config = Some(v);
         self
     }
     pub fn timeout(mut self, v: Duration) -> Self {
@@ -143,6 +153,7 @@ impl GrpcClientConfigBuilder {
             server_addr,
             server_port,
             use_tls,
+            tls_config,
             timeout,
             identity,
             env,
@@ -185,6 +196,7 @@ impl GrpcClientConfigBuilder {
             server_addr: server_addr.unwrap_or_else(|| "localhost".into()),
             server_port: server_port.unwrap_or(DEFAULT_GRPC_PORT),
             use_tls: use_tls.unwrap_or(false),
+            tls_config,
             timeout: timeout.unwrap_or(DEFAULT_TIMEOUT),
             identity,
         }

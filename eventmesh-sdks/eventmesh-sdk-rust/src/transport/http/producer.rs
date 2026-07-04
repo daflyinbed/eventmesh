@@ -168,7 +168,7 @@ fn validate_publish(message: &EventMeshMessage) -> Result<()> {
     if message
         .content
         .as_deref()
-        .map(|c| c.is_empty())
+        .map(|c| c.trim().is_empty())
         .unwrap_or(true)
     {
         return Err(EventMeshError::InvalidMessage("content is required".into()));

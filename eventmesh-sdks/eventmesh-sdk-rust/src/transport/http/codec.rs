@@ -33,7 +33,8 @@
 //! - [`PushMessageRequestBody::to_event_mesh_message`] — decode it into an
 //!   [`EventMeshMessage`].
 //! - [`WebhookReply`] — the JSON acknowledgment the runtime expects
-//!   (`{"retCode": 0}` on success, a non-zero code to request retry).
+//!   ([`WebhookReply::ok()`] returns `retCode: 1`; the runtime also accepts
+//!   `retCode: 0`. A non-zero code other than 1 requests retry).
 //!
 //! ```no_run
 //! # use eventmesh::http::codec::{parse_push_body, WebhookReply};

@@ -132,8 +132,15 @@ impl HttpConsumer {
                     },
                 );
             }
+            Ok(response)
+        } else {
+            Err(EventMeshError::Server {
+                code: response.code.unwrap_or(-1) as i32,
+                message: response
+                    .message
+                    .unwrap_or_else(|| "subscribe failed".into()),
+            })
         }
-        Ok(response)
     }
 
     /// Current consumer group.

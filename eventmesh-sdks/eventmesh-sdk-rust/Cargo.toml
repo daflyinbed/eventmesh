@@ -106,6 +106,6 @@ path = "examples/http/consumer_server.rs"
 required-features = ["http"]
 
 [[example]]
-name = "http_consumer_middleware"
-path = "examples/http/consumer_middleware.rs"
+name = "http_consumer_custom"
+path = "examples/http/consumer_custom.rs"
 required-features = ["http"]

@@ -15,44 +15,17 @@
 // under the License.
 //
 
-//! Webhook middleware for receiving pushed messages from the EventMesh runtime.
+//! Internal webhook handler used by the built-in [`WebhookServer`].
 //!
-//! The runtime POSTs messages to the consumer's registered webhook URL using
-//! `application/x-www-form-urlencoded` bodies. This module provides:
+//! This module is **not** part of the public API. It wires the push-body codec
+//! ([`crate::transport::http::codec::parse_push_body`]) together with a
+//! [`MessageListener`] into an axum handler consumed exclusively by
+//! [`WebhookServer`](crate::transport::http::server::WebhookServer).
 //!
-//! - [`WebhookHandler`] — an axum handler/extractor that parses the push body,
-//!   dispatches to a [`MessageListener`], and returns the JSON acknowledgment.
-//! - [`WebhookLayer`] — a convenience wrapper that produces the
-//!   [`WebhookState`] for an axum `Router::with_state` call.
-//! - [`WebhookState`] — shared state holding the listener, passed via axum's
-//!   `State` extractor.
-//!
-//! # Example (axum)
-//!
-//! ```no_run
-//! # use eventmesh::{
-//! #     config::HttpClientConfig,
-//! #     http::{HttpConsumer, WebhookHandler, WebhookState},
-//! #     model::{EventMeshMessage, SubscriptionItem, SubscriptionMode, SubscriptionType},
-//! #     MessageListener,
-//! # };
-//! # use axum::{Router, routing::post};
-//! # use std::sync::Arc;
-//! # struct MyListener;
-//! # impl MessageListener for MyListener {
-//! #     type Message = EventMeshMessage;
-//! #     async fn handle(&self, _: Self::Message) -> Option<Self::Message> { None }
-//! # }
-//! # #[eventmesh::main]
-//! # async fn main() -> eventmesh::Result<()> {
-//! let listener = Arc::new(MyListener);
-//! let state = WebhookState::new(listener);
-//! let app: Router = Router::new()
-//!     .route("/eventmesh/callback", post(WebhookHandler::handle))
-//!     .with_state(state);
-//! # Ok(())
-//! # }
-//! ```
+//! Users who want to host their own HTTP endpoint (with axum, actix, plain
+//! hyper, or any other framework) should ignore this module and build on the
+//! public codec utilities directly — see the `consumer_custom` example and the
+//! [`codec`](crate::transport::http::codec) module docs.
 
 use std::sync::Arc;
 
@@ -68,19 +41,14 @@ use crate::transport::http::codec::{parse_push_body, WebhookReply};
 use crate::MessageListener;
 
 /// Shared state for the webhook handler, holding the message listener.
-pub struct WebhookState<L: MessageListener<Message = EventMeshMessage>> {
+pub(crate) struct WebhookState<L: MessageListener<Message = EventMeshMessage>> {
     listener: Arc<L>,
 }
 
 impl<L: MessageListener<Message = EventMeshMessage>> WebhookState<L> {
     /// Create state wrapping the given listener.
-    pub fn new(listener: Arc<L>) -> Self {
+    pub(crate) fn new(listener: Arc<L>) -> Self {
         Self { listener }
-    }
-
-    /// Access the inner listener.
-    pub fn listener(&self) -> &L {
-        &self.listener
     }
 }
 
@@ -92,22 +60,18 @@ impl<L: MessageListener<Message = EventMeshMessage>> Clone for WebhookState<L> {
     }
 }
 
-/// Axum handler that processes an EventMesh webhook push.
+/// Internal axum handler used by [`WebhookServer`](crate::transport::http::server::WebhookServer).
 ///
-/// Register it on a route:
-///
-/// ```ignore
-/// Router::new()
-///     .route("/cb", post(WebhookHandler::handle))
-///     .with_state(state);
-/// ```
-pub struct WebhookHandler;
+/// Not part of the public API. To receive pushes on your own server, implement
+/// a handler with the public [`codec`](crate::transport::http::codec) helpers
+/// instead (see the `consumer_custom` example).
+pub(crate) struct WebhookHandler;
 
 impl WebhookHandler {
     /// The actual handler function. Extracts the body bytes, parses the
     /// form-urlencoded push body, dispatches to the listener, and returns the
     /// JSON acknowledgment `{"retCode": <int>}`.
-    pub async fn handle<L: MessageListener<Message = EventMeshMessage>>(
+    pub(crate) async fn handle<L: MessageListener<Message = EventMeshMessage>>(
         State(state): State<WebhookState<L>>,
         _headers: HeaderMap,
         body: Bytes,
@@ -159,31 +123,6 @@ impl WebhookHandler {
                 Json(WebhookReply::ok()).into_response()
             }
             None => Json(WebhookReply::ok()).into_response(),
-        }
-    }
-}
-
-/// A convenience wrapper that produces [`WebhookState`] for an axum
-/// `Router::with_state` call.
-///
-/// Despite the name, this is **not** a `tower::Layer` — it does not wrap a
-/// service. It is a thin builder that bridges a [`MessageListener`] into the
-/// [`WebhookState`] consumed by [`WebhookHandler`]. In most cases you'll just
-/// register the [`WebhookHandler`] on an axum route.
-pub struct WebhookLayer<L: MessageListener<Message = EventMeshMessage>> {
-    listener: Arc<L>,
-}
-
-impl<L: MessageListener<Message = EventMeshMessage>> WebhookLayer<L> {
-    /// Create a layer wrapping the given listener.
-    pub fn new(listener: Arc<L>) -> Self {
-        Self { listener }
-    }
-
-    /// Build the [`WebhookState`] for use with an axum `Router::with_state`.
-    pub fn into_state(self) -> WebhookState<L> {
-        WebhookState {
-            listener: self.listener,
         }
     }
 }

@@ -34,7 +34,7 @@
 //! #     type Message = EventMeshMessage;
 //! #     async fn handle(&self, _: Self::Message) -> Option<Self::Message> { None }
 //! # }
-//! # #[eventmesh::main]
+//! # #[tokio::main]
 //! # async fn main() -> eventmesh::Result<()> {
 //! use std::sync::Arc;
 //!

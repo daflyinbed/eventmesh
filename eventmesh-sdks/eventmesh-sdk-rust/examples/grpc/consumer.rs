@@ -47,7 +47,7 @@ impl MessageListener for PrintingListener {
     }
 }
 
-#[eventmesh::main]
+#[tokio::main]
 async fn main() -> eventmesh::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)

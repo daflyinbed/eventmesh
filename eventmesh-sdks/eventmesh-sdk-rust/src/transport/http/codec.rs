@@ -21,6 +21,52 @@
 //! payloads are serialized as JSON strings and placed in the `content` field.
 //! This mirrors the Java SDK's `EventMeshMessageProducer` /
 //! `CloudEventProducer` / `EventMeshHttpConsumer` wire format.
+//!
+//! # Building a custom webhook endpoint
+//!
+//! Besides the built-in [`WebhookServer`](crate::transport::http::WebhookServer),
+//! you can host your own HTTP endpoint (axum, actix, plain hyper, …) and decode
+//! runtime pushes with these framework-agnostic helpers:
+//!
+//! - [`parse_push_body`] — parse the form-urlencoded push body into a
+//!   [`PushMessageRequestBody`].
+//! - [`PushMessageRequestBody::to_event_mesh_message`] — decode it into an
+//!   [`EventMeshMessage`].
+//! - [`WebhookReply`] — the JSON acknowledgment the runtime expects
+//!   (`{"retCode": 0}` on success, a non-zero code to request retry).
+//!
+//! ```no_run
+//! # use eventmesh::http::codec::{parse_push_body, WebhookReply};
+//! # use eventmesh::MessageListener;
+//! # use eventmesh::model::EventMeshMessage;
+//! # use axum::{extract::State, response::IntoResponse, Json};
+//! # use bytes::Bytes;
+//! # use std::sync::Arc;
+//! # struct MyListener;
+//! # impl MessageListener for MyListener {
+//! #     type Message = EventMeshMessage;
+//! #     async fn handle(&self, _: Self::Message) -> Option<Self::Message> { None }
+//! # }
+//! // Axum handler written by the user — no SDK handler type involved.
+//! async fn webhook(
+//!     State(listener): State<Arc<MyListener>>,
+//!     body: Bytes,
+//! ) -> impl IntoResponse {
+//!     let text = match std::str::from_utf8(&body) {
+//!         Ok(s) => s,
+//!         Err(_) => return Json(WebhookReply::retry("invalid UTF-8")),
+//!     };
+//!     match parse_push_body(text).and_then(|p| p.to_event_mesh_message()) {
+//!         Ok(msg) => {
+//!             listener.handle(msg).await;
+//!             Json(WebhookReply::ok())
+//!         }
+//!         Err(_) => Json(WebhookReply::retry("decode error")),
+//!     }
+//! }
+//! ```
+//!
+//! See the `http_consumer_custom` example for a complete, runnable version.
 
 use std::collections::HashMap;
 

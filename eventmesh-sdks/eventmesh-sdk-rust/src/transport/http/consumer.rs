@@ -49,9 +49,10 @@ struct SubscriptionEntry {
 /// HTTP-based consumer.
 ///
 /// The consumer registers a webhook URL with the EventMesh runtime and sends
-/// periodic heartbeats. The runtime pushes messages to that URL — the user is
-/// responsible for serving the webhook endpoint (see [`WebhookLayer`](crate::transport::http::WebhookLayer)
-/// or [`WebhookServer`](crate::transport::http::WebhookServer)).
+/// periodic heartbeats. The runtime pushes messages to that URL — serve it
+/// either with the built-in [`WebhookServer`](crate::transport::http::WebhookServer)
+/// or your own HTTP endpoint built on the
+/// [`codec`](crate::transport::http::codec) helpers.
 ///
 /// A background heartbeat task is spawned on construction and stopped on drop
 /// or via [`HttpConsumer::shutdown`].

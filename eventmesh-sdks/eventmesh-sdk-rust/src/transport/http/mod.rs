@@ -18,9 +18,8 @@
 //! HTTP transport for EventMesh.
 //!
 //! Provides an HTTP-based [`Publisher`](crate::transport::Publisher) and
-//! [`Subscriber`](crate::transport::Subscriber), plus a tower-compatible
-//! webhook middleware for receiving pushed messages from the EventMesh
-//! runtime.
+//! [`Subscriber`](crate::transport::Subscriber), plus a built-in
+//! [`WebhookServer`] for receiving pushed messages from the EventMesh runtime.
 //!
 //! # Wire format
 //!
@@ -28,16 +27,31 @@
 //! payloads inside the `content` field, mirroring the Java SDK. The runtime
 //! pushes messages to the consumer's registered webhook URL in the same
 //! format, expecting a JSON reply `{"retCode": <int>}`.
+//!
+//! # Receiving pushed messages
+//!
+//! The HTTP consumer is client-only: it registers a webhook URL with the
+//! runtime and sends heartbeats, and the runtime POSTs delivered messages to
+//! that URL. There are two ways to serve that URL:
+//!
+//! 1. **Built-in server** — [`WebhookServer`] is a batteries-included axum
+//!    server. Construct it, register its [`WebhookServer::url`] via
+//!    [`HttpConsumer::subscribe_webhook`], then `.await` it. See the
+//!    `http_consumer_server` example.
+//! 2. **Your own endpoint** — host any HTTP server (axum, actix, plain hyper,
+//!    …) and decode pushes with the framework-agnostic
+//!    [`codec`](crate::transport::http::codec) helpers
+//!    ([`codec::parse_push_body`], [`codec::PushMessageRequestBody`],
+//!    [`codec::WebhookReply`]). See the `http_consumer_custom` example.
 
 pub mod client;
 pub mod codec;
 pub mod consumer;
 pub mod producer;
 pub mod server;
-pub mod webhook;
+mod webhook;
 
 pub use client::EventMeshHttpClient;
 pub use consumer::HttpConsumer;
 pub use producer::HttpProducer;
 pub use server::WebhookServer;
-pub use webhook::{WebhookHandler, WebhookLayer, WebhookState};

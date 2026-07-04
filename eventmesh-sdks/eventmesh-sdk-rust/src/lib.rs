@@ -32,7 +32,9 @@
 //! - [`grpc::GrpcProducer`] — publish / batch / request-reply.
 //! - [`grpc::GrpcConsumer`] — webhook + bidirectional-stream subscription.
 //! - [`http::HttpProducer`] — HTTP publish / request-reply.
-//! - [`http::HttpConsumer`] — HTTP subscribe / heartbeat + webhook support.
+//! - [`http::HttpConsumer`] — HTTP subscribe / heartbeat; receive pushes via
+//!   the built-in [`http::WebhookServer`] or your own endpoint built on the
+//!   [`http::codec`] helpers.
 //!
 //! # Quick example (gRPC producer)
 //!
@@ -91,12 +93,6 @@ pub use transport::http;
 pub use error::{EventMeshError, Result};
 
 use std::future::Future;
-
-/// Alias so callers can write `eventmesh::main`.
-///
-/// This re-exports `tokio::main` under the crate namespace for ergonomic
-/// `#[eventmesh::main]` attribute usage in examples and user code.
-pub use tokio::main;
 
 /// Convenience trait alias for an async listener of delivered messages.
 ///

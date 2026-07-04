@@ -305,7 +305,7 @@ pub(crate) fn build_reply(
 /// #     model::{EventMeshMessage, SubscriptionItem, SubscriptionMode, SubscriptionType},
 /// #     MessageListener,
 /// # };
-/// # #[eventmesh::main]
+/// # #[tokio::main]
 /// # async fn main() -> eventmesh::Result<()> {
 /// #     let consumer = GrpcConsumer::new(GrpcClientConfig::builder().build(), MyListener)?;
 /// #     let items = vec![SubscriptionItem::new("t", SubscriptionMode::CLUSTERING, SubscriptionType::ASYNC)];

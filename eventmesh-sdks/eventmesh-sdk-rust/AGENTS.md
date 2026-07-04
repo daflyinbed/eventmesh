@@ -69,25 +69,29 @@ Add convenience aliases in `proto_gen.rs`, not in the generated module.
 - `src/config/http.rs` — `HttpClientConfig` + fluent builder. Accepts
   semicolon/comma-separated `host:port[:weight]` server lists; uses the shared
   `LoadBalanceSelector` from `common/loadbalance.rs`.
-- `src/transport/http/webhook.rs` — axum handler + tower-compatible `WebhookLayer`
-  for receiving pushed messages from the runtime.
+- `src/transport/http/webhook.rs` — **internal** axum handler (`WebhookHandler`
+  + `WebhookState`) used only by `WebhookServer`. Not part of the public API.
 - `src/transport/http/server.rs` — built-in `WebhookServer` (axum) implementing
   `IntoFuture` for one-liner `.await` startup with optional graceful shutdown.
 - `src/common/` — `ProtocolKey`, status codes, constants, `LoadBalanceSelector`
   shared across transports.
-- `#[eventmesh::main]` is just a re-export of `tokio::main`.
 
 ### HTTP transport specifics
 
 - The HTTP consumer is **client-only** (like the Java SDK): it registers a
   webhook URL with the runtime and sends heartbeats. The runtime POSTs messages
-  to that URL. The SDK provides three ways to receive those pushes:
-  1. **`WebhookHandler`** — an axum handler function, registered on the user's
-     own `Router`.
-  2. **`WebhookServer`** — a built-in axum server (`IntoFuture` + graceful
+  to that URL. The SDK provides two ways to receive those pushes:
+  1. **`WebhookServer`** — a built-in axum server (`IntoFuture` + graceful
      shutdown) for users who don't want to manage their own HTTP server.
-  3. **Standalone** — the user hosts any HTTP endpoint and uses the codec
-     utilities (`parse_push_body`) directly.
+  2. **Custom endpoint** — the user hosts any HTTP server (axum, actix, hyper,
+     …) and decodes pushes with the **public codec helpers** in
+     `src/transport/http/codec.rs`: `parse_push_body`,
+     `PushMessageRequestBody::to_event_mesh_message`, and `WebhookReply`
+     (the `{"retCode": 0}` ack). See the `http_consumer_custom` example.
+- There is intentionally **no public `WebhookHandler`/`WebhookLayer`/`WebhookState`**
+  type. The old "register the SDK's handler on your own Router" mode was
+  removed; users who embed the webhook in their own app write the handler
+  themselves on top of the codec utilities.
 - Runtime routing: the EventMesh HTTP server has two routing mechanisms —
   path-based (new-style handlers, checked first by URI prefix match) and
   code-header-based (old-style, checked by the `code` header when no path

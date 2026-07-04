@@ -1,9 +1,11 @@
 # AGENTS.md — EventMesh Rust SDK
 
 Cargo crate `eventmesh` (`edition = "2021"`, **MSRV 1.75.0**). Speaks the
-EventMesh **gRPC** protocol only (HTTP/TCP are stubbed as Phase 2/3 in
-`Cargo.toml` but unimplemented). Wire format is CloudEvents-protobuf; the simple
-`EventMeshMessage` model is converted at the gRPC boundary by `codec.rs`.
+EventMesh **gRPC** and **HTTP** protocols (TCP is stubbed as Phase 3 in
+`Cargo.toml` but unimplemented). gRPC wire format is CloudEvents-protobuf; the
+simple `EventMeshMessage` model is converted at the gRPC boundary by
+`codec.rs`. HTTP wire format is `application/x-www-form-urlencoded` with JSON
+payloads in the `content` field, mirroring the Java SDK.
 
 This crate is **not** part of the Gradle build and has **no GitHub Actions
 CI**. All verification is local. The parent repo `AGENTS.md` covers the
@@ -23,10 +25,11 @@ PROTOC=$HOME/.local/bin/protoc cargo build --features full
 
 | Feature | Notes |
 |---|---|
-| `grpc` (default) | gRPC transport — essentially the whole SDK. Disable only for pure message-model use. |
+| `grpc` (default) | gRPC transport — publish, batch, request-reply, stream/webhook subscribe. |
+| `http` | HTTP transport — `HttpProducer`, `HttpConsumer`, webhook middleware + built-in `WebhookServer`. Uses reqwest + axum. |
 | `cloud_events` | Native `cloudevents::Event` interop. |
 | `tls` | TLS on the gRPC channel. |
-| `full` | `grpc` + `cloud_events` + `tls`. Use this for clippy/test so every code path compiles. |
+| `full` | `grpc` + `http` + `cloud_events` + `tls`. Use this for clippy/test so every code path compiles. |
 | `e2e` | Gates the live-server integration suite (`tests/e2e/`). A plain `cargo test` never touches Docker. |
 
 ## Verification (the order the README mandates)
@@ -54,13 +57,48 @@ Add convenience aliases in `proto_gen.rs`, not in the generated module.
 - `src/lib.rs` is `#![deny(unsafe_code)]` — no `unsafe` anywhere.
 - `src/transport/mod.rs` defines `Publisher` / `Subscriber` as **async-fn-in-trait**
   (Rust 1.75). They are therefore **not object-safe** — use the concrete
-  `GrpcProducer` / `GrpcConsumer` directly, never `dyn`.
+  `GrpcProducer` / `GrpcConsumer` / `HttpProducer` / `HttpConsumer` directly,
+  never `dyn`.
 - `src/transport/grpc/codec.rs` is the `EventMeshMessage` ↔ CloudEvents-protobuf
-  bridge; it is the only place wire encoding happens.
-- `src/config/grpc.rs` — `GrpcClientConfig` + fluent builder (identity fields:
-  `env`/`idc`/`sys`/`producer_group`/`consumer_group`/`username`/`password`/`token`).
-- `src/common/` — `ProtocolKey`, status codes, constants used in gRPC headers/attrs.
+  bridge for the gRPC transport.
+- `src/transport/http/codec.rs` is the `EventMeshMessage` ↔ form-urlencoded +
+  JSON bridge for the HTTP transport. The wire format is
+  `application/x-www-form-urlencoded` (not JSON bodies); payloads go in the
+  `content` form field as JSON strings.
+- `src/config/grpc.rs` — `GrpcClientConfig` + fluent builder.
+- `src/config/http.rs` — `HttpClientConfig` + fluent builder. Accepts
+  semicolon/comma-separated `host:port[:weight]` server lists; uses the shared
+  `LoadBalanceSelector` from `common/loadbalance.rs`.
+- `src/transport/http/webhook.rs` — axum handler + tower-compatible `WebhookLayer`
+  for receiving pushed messages from the runtime.
+- `src/transport/http/server.rs` — built-in `WebhookServer` (axum) implementing
+  `IntoFuture` for one-liner `.await` startup with optional graceful shutdown.
+- `src/common/` — `ProtocolKey`, status codes, constants, `LoadBalanceSelector`
+  shared across transports.
 - `#[eventmesh::main]` is just a re-export of `tokio::main`.
+
+### HTTP transport specifics
+
+- The HTTP consumer is **client-only** (like the Java SDK): it registers a
+  webhook URL with the runtime and sends heartbeats. The runtime POSTs messages
+  to that URL. The SDK provides three ways to receive those pushes:
+  1. **`WebhookHandler`** — an axum handler function, registered on the user's
+     own `Router`.
+  2. **`WebhookServer`** — a built-in axum server (`IntoFuture` + graceful
+     shutdown) for users who don't want to manage their own HTTP server.
+  3. **Standalone** — the user hosts any HTTP endpoint and uses the codec
+     utilities (`parse_push_body`) directly.
+- Runtime routing: the EventMesh HTTP server has two routing mechanisms —
+  path-based (new-style handlers, checked first by URI prefix match) and
+  code-header-based (old-style, checked by the `code` header when no path
+  matches). Because this SDK sends `application/x-www-form-urlencoded` bodies,
+  **all** operations (publish, subscribe, unsubscribe, heartbeat) use
+  code-header-based routing via the root path `/` (`uri::ROOT`). Posting to a
+  path-based handler (e.g. `/eventmesh/subscribe/local`) with a form body breaks
+  body decoding: the `topic` form field is parsed as a string and cannot be
+  deserialized as `List<SubscriptionItem>`.
+- Heartbeat interval: 30s (mirrors the Java SDK), spawned as a background
+  tokio task tied to a `CancellationToken`.
 
 ## End-to-end tests (`tests/e2e/`)
 

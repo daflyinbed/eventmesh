@@ -1,0 +1,398 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership.  The ASF
+// licenses this file to You under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance with the
+// License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+
+//! TCP consumer.
+
+use std::future::{Future, IntoFuture};
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::FutureExt;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+use crate::config::TcpClientConfig;
+use crate::error::{EventMeshError, Result};
+use crate::model::{EventMeshMessage, PublishResponse, SubscriptionItem};
+use crate::transport::tcp::connection::TcpConnection;
+use crate::transport::tcp::frame::{Command, Package, UserAgent};
+use crate::transport::tcp::message;
+use crate::transport::Subscriber;
+use crate::MessageListener;
+
+/// TCP-based consumer, generic over the user's [`MessageListener`] type.
+///
+/// Created via [`TcpConsumer::connect`], which opens a TCP connection, performs
+/// the HELLO handshake (role = sub), and starts the background heartbeat.
+///
+/// Call [`TcpConsumer::listen`] to subscribe + enter the receive loop. This
+/// returns a [`ListenServe`] driver that implements [`IntoFuture`] — axum-style,
+/// a single `.await` drives everything:
+///
+/// ```ignore
+/// consumer.listen(items)?.with_graceful_shutdown(sig).await?;
+/// ```
+pub struct TcpConsumer<L: MessageListener<Message = EventMeshMessage>> {
+    conn: Arc<TcpConnection>,
+    config: TcpClientConfig,
+    listener: Arc<L>,
+    shutdown: CancellationToken,
+    subscriptions: Arc<Mutex<Vec<SubscriptionItem>>>,
+}
+
+impl<L: MessageListener<Message = EventMeshMessage>> TcpConsumer<L> {
+    /// Connect to the EventMesh TCP endpoint and perform the HELLO handshake
+    /// (role = sub).
+    pub async fn connect(config: TcpClientConfig, listener: L) -> Result<Self> {
+        let user_agent = UserAgent::from_identity(&config.identity, config.server_port, "sub");
+        let conn = TcpConnection::connect(
+            &config.server_addr,
+            config.server_port,
+            &user_agent,
+            config.heartbeat_interval,
+            config.timeout,
+        )
+        .await?;
+
+        Ok(Self {
+            conn: Arc::new(conn),
+            config,
+            listener: Arc::new(listener),
+            shutdown: CancellationToken::new(),
+            subscriptions: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// Prepare a subscription + receive-loop driver. Returns synchronously;
+    /// the actual I/O happens on the first `.await` of the returned
+    /// [`ListenServe`].
+    ///
+    /// The driver sends `SUBSCRIBE_REQUEST` for each topic, then
+    /// `LISTEN_REQUEST`, and enters the receive loop — dispatching delivered
+    /// messages to the listener and sending ACKs / replies.
+    pub fn listen(&self, items: Vec<SubscriptionItem>) -> Result<ListenServe<L>> {
+        if items.is_empty() {
+            return Err(EventMeshError::InvalidArgument(
+                "subscription items must not be empty".into(),
+            ));
+        }
+        Ok(ListenServe {
+            conn: Arc::clone(&self.conn),
+            items,
+            listener: Arc::clone(&self.listener),
+            config: self.config.clone(),
+            shutdown: self.shutdown.clone(),
+            subscriptions: Arc::clone(&self.subscriptions),
+            subscribed: false,
+        })
+    }
+
+    /// Add more subscriptions without restarting the receive loop. Sends a
+    /// `SUBSCRIBE_REQUEST` for each item via `io()`.
+    pub async fn add_subscription(&self, items: &[SubscriptionItem]) -> Result<()> {
+        for item in items {
+            let sub_pkg = message::subscribe(&item.topic, std::slice::from_ref(item));
+            let resp = self.conn.io(sub_pkg, self.config.timeout).await?;
+            let response = message::response_from_pkg(&resp);
+            if !response.is_success() {
+                return Err(EventMeshError::Server {
+                    code: response.code.unwrap_or(-1) as i32,
+                    message: response
+                        .message
+                        .unwrap_or_else(|| "subscribe failed".into()),
+                });
+            }
+            self.subscriptions.lock().await.push(item.clone());
+        }
+        Ok(())
+    }
+
+    /// Graceful shutdown: cancel the shared token and shut down the connection.
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.conn.shutdown().await;
+    }
+
+    /// Current config.
+    pub fn config(&self) -> &TcpClientConfig {
+        &self.config
+    }
+}
+
+impl<L: MessageListener<Message = EventMeshMessage>> Subscriber for TcpConsumer<L> {
+    async fn subscribe(&self, items: Vec<SubscriptionItem>) -> Result<PublishResponse> {
+        // Perform subscription synchronously so broker rejections (ACL, bad
+        // topic, server not RUNNING) surface as an `Err` to the caller instead
+        // of being swallowed into a `warn!` log inside the spawned task. This
+        // matches `add_subscription`, which is what we delegate to: it records
+        // each topic in `self.subscriptions` only after the server confirms it.
+        self.add_subscription(&items).await?;
+
+        // Spawn the listen + receive loop in the background. The driver skips
+        // re-subscription since `add_subscription` already confirmed every
+        // topic (see `ListenServe::subscribed`).
+        let mut serve = self.listen(items)?;
+        serve.subscribed = true;
+        tokio::spawn(async move {
+            if let Err(e) = serve.await {
+                warn!("listen driver exited with error: {e}");
+            }
+        });
+        Ok(PublishResponse::new(
+            Some(0),
+            Some("subscribed".into()),
+            None,
+        ))
+    }
+
+    async fn unsubscribe(&self, items: Vec<SubscriptionItem>) -> Result<PublishResponse> {
+        if items.is_empty() {
+            return Err(EventMeshError::InvalidArgument(
+                "unsubscribe items must not be empty".into(),
+            ));
+        }
+        let unsub_pkg = message::unsubscribe(&items);
+        let resp = self.conn.io(unsub_pkg, self.config.timeout).await?;
+        let response = message::response_from_pkg(&resp);
+
+        if response.is_success() {
+            let mut subs = self.subscriptions.lock().await;
+            for item in &items {
+                subs.retain(|s| s.topic != item.topic);
+            }
+        }
+        Ok(response)
+    }
+}
+
+impl<L: MessageListener<Message = EventMeshMessage>> Drop for TcpConsumer<L> {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ListenServe driver
+// ---------------------------------------------------------------------------
+
+/// Foreground driver for a TCP subscription + receive loop.
+///
+/// Returned (synchronously) by [`TcpConsumer::listen`]. Subscribe + listen
+/// happen lazily on the first `.await`, so awaiting this driver both subscribes
+/// and runs the receive loop in one step — dispatching delivered messages to
+/// the registered listener and sending back ACKs/replies until the connection
+/// closes or a graceful shutdown fires.
+///
+/// Bind an external trigger (Ctrl-C, a `oneshot`, etc.) with
+/// [`ListenServe::with_graceful_shutdown`].
+pub struct ListenServe<L: MessageListener<Message = EventMeshMessage>> {
+    conn: Arc<TcpConnection>,
+    items: Vec<SubscriptionItem>,
+    listener: Arc<L>,
+    config: TcpClientConfig,
+    shutdown: CancellationToken,
+    subscriptions: Arc<Mutex<Vec<SubscriptionItem>>>,
+    /// Whether the topics in `items` have already been confirmed by the server
+    /// (via [`TcpConsumer::add_subscription`]). When `true`, [`IntoFuture`]
+    /// skips the subscription phase and goes straight to LISTEN + receive loop.
+    /// Set by [`Subscriber::subscribe`] so broker rejections surface to the
+    /// caller rather than being swallowed in the spawned task.
+    subscribed: bool,
+}
+
+impl<L: MessageListener<Message = EventMeshMessage>> ListenServe<L> {
+    /// Bind an external shutdown signal. When `signal` resolves the consumer's
+    /// shared cancellation token is triggered, which stops the receive loop.
+    pub fn with_graceful_shutdown(self, signal: impl Future<Output = ()> + Send + 'static) -> Self {
+        let token = self.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = signal => token.cancel(),
+                _ = token.cancelled() => {}
+            }
+        });
+        self
+    }
+}
+
+impl<L: MessageListener<Message = EventMeshMessage>> IntoFuture for ListenServe<L> {
+    type Output = Result<()>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let Self {
+            conn,
+            items,
+            listener,
+            config,
+            shutdown,
+            subscriptions,
+            subscribed,
+        } = self;
+
+        Box::pin(async move {
+            // 1. Subscribe to each topic — unless the caller already did (e.g.
+            //    `Subscriber::subscribe` calls `add_subscription` inline so
+            //    broker rejections surface synchronously).
+            if !subscribed {
+                for item in &items {
+                    let sub_pkg = message::subscribe(&item.topic, std::slice::from_ref(item));
+                    let resp = conn.io(sub_pkg, config.timeout).await?;
+                    let response = message::response_from_pkg(&resp);
+                    if !response.is_success() {
+                        return Err(EventMeshError::Server {
+                            code: response.code.unwrap_or(-1) as i32,
+                            message: response
+                                .message
+                                .unwrap_or_else(|| "subscribe failed".into()),
+                        });
+                    }
+                    // Record the subscription ONLY after the server confirms it,
+                    // mirroring add_subscription. This prevents phantom entries in
+                    // self.subscriptions if the driver fails partway through.
+                    subscriptions.lock().await.push(item.clone());
+                    debug!(
+                        topic = ?item.topic,
+                        cmd = ?resp.header.cmd,
+                        "subscribed"
+                    );
+                }
+            }
+
+            // 2. Send LISTEN_REQUEST to enter receive mode.
+            let listen_pkg = message::listen();
+            let listen_resp = conn.io(listen_pkg, config.timeout).await?;
+            let listen_status = message::response_from_pkg(&listen_resp);
+            if !listen_status.is_success() {
+                return Err(EventMeshError::Server {
+                    code: listen_status.code.unwrap_or(-1) as i32,
+                    message: listen_status
+                        .message
+                        .unwrap_or_else(|| "listen failed".into()),
+                });
+            }
+            debug!("LISTEN ok, entering receive loop");
+
+            // 3. Take the inbound receiver (only available once).
+            let mut inbound_rx = conn
+                .take_inbound_rx()
+                .await
+                .ok_or_else(|| EventMeshError::Tcp("inbound receiver already taken".into()))?;
+
+            // 4. Receive loop.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        debug!("receive loop shutting down");
+                        break;
+                    }
+                    pkg = inbound_rx.recv() => {
+                        match pkg {
+                            Some(pkg) => {
+                                handle_inbound(&pkg, &conn, &*listener).await;
+                            }
+                            None => {
+                                info!("inbound channel closed, exiting receive loop");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Dispatch an inbound package: parse the message, invoke the listener, send
+/// any reply, then send the matching ACK.
+///
+/// The ACK is sent **after** the listener returns, mirroring the Java SDK's
+/// `AbstractEventMeshTCPSubHandler.channelRead0` ordering (`callback` →
+/// `response`). Note the Java handler always ACKs regardless of whether the
+/// body parsed — we do the same: an unparseable body is logged and skipped (the
+/// listener is not invoked) but the ACK is still sent, matching Java's
+/// `callback(getProtocolMessage(msg), ctx); response(ack)` flow. This means
+/// at-least-once redelivery applies to crashes *between* the listener returning
+/// and the ACK being written, not to client-side parse failures.
+async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
+    pkg: &Package,
+    conn: &TcpConnection,
+    listener: &L,
+) {
+    let ack_cmd = match pkg.header.cmd {
+        Command::RequestToClient => Some(Command::RequestToClientAck),
+        Command::AsyncMessageToClient => Some(Command::AsyncMessageToClientAck),
+        Command::BroadcastMessageToClient => Some(Command::BroadcastMessageToClientAck),
+        Command::ServerGoodbyeRequest => {
+            // The server initiated a goodbye (shutdown / redirect). The Java
+            // runtime's `GoodbyeProcessor` expects the client to reply with
+            // `SERVER_GOODBYE_RESPONSE` (distinct from the client-initiated
+            // `CLIENT_GOODBYE_REQUEST`/`CLIENT_GOODBYE_RESPONSE` pair). The
+            // server closes the session regardless (`closeSessionIfTimeout` is
+            // unconditional), so this ACK is best-effort: a write failure only
+            // means the socket is already gone.
+            info!("server goodbye received, sending SERVER_GOODBYE_RESPONSE");
+            let resp = message::ack(Command::ServerGoodbyeResponse, pkg);
+            if let Err(e) = conn.send(resp).await {
+                warn!(error = %e, "failed to send SERVER_GOODBYE_RESPONSE");
+            }
+            return;
+        }
+        cmd => {
+            warn!(?cmd, "unexpected inbound command, ignoring");
+            return;
+        }
+    };
+
+    // Parse message body and invoke listener BEFORE sending the ACK.
+    if let Some(msg) = message::parse_message(&pkg.body) {
+        debug!(topic = ?msg.topic, "dispatching to listener");
+        // Listener may return a reply (for REQUEST_TO_CLIENT). The Java SDK
+        // sends RESPONSE_TO_SERVER inside the callback, before the ACK.
+        // Guard against a panicking listener so it cannot kill the receive
+        // loop (which would stall the inbound channel and freeze heartbeats).
+        match AssertUnwindSafe(listener.handle(msg)).catch_unwind().await {
+            Ok(Some(reply)) => {
+                match message::build_message_package(&reply, Command::ResponseToServer) {
+                    Ok(reply_pkg) => {
+                        if let Err(e) = conn.send(reply_pkg).await {
+                            warn!(error = %e, "failed to send reply");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to serialize reply"),
+                }
+            }
+            Ok(None) => {}
+            Err(_) => warn!("message listener panicked; ACK will still be sent"),
+        }
+    } else {
+        warn!("failed to parse inbound message body");
+    }
+
+    // Send ACK after the listener has processed the message.
+    if let Some(cmd) = ack_cmd {
+        let ack_pkg = message::ack(cmd, pkg);
+        if let Err(e) = conn.send(ack_pkg).await {
+            warn!(error = %e, "failed to send ACK");
+        }
+    }
+}

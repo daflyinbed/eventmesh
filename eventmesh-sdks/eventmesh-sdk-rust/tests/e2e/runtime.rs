@@ -38,6 +38,8 @@ use tracing::{info, warn};
 pub(crate) const GRPC_PORT: u16 = 10_205;
 /// HTTP port of the EventMesh runtime.
 pub(crate) const HTTP_PORT: u16 = 10_105;
+/// TCP port of the EventMesh runtime.
+pub(crate) const TCP_PORT: u16 = 10_000;
 /// Admin (HTTP) port, used for topic creation + readiness probes.
 pub(crate) const ADMIN_PORT: u16 = 10_106;
 /// Host the runtime is reachable on from the test host.

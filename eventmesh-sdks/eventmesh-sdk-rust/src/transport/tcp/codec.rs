@@ -285,7 +285,7 @@ mod tests {
         let decoded = decoded.expect("should have a frame");
 
         assert_eq!(decoded.header.cmd, Command::HeartbeatRequest);
-        assert_eq!(decoded.header.seq, "1234567890");
+        assert_eq!(decoded.header.seq.as_deref(), Some("1234567890"));
         assert!(matches!(decoded.body, PackageBody::Empty));
         assert!(buf.is_empty(), "buffer should be fully consumed");
     }

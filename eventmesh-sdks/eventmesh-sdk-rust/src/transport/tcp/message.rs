@@ -92,10 +92,18 @@ pub fn package(cmd: Command) -> Package {
 
 /// Build an ACK package for an inbound `in_pkg`, copying its seq and body.
 /// Mirrors Java `MessageUtils.getPackage(command, in)`.
+///
+/// The seq is copied verbatim (including `None`): server-initiated frames such
+/// as `SERVER_GOODBYE_REQUEST` arrive without a seq, and the ACK must echo that
+/// shape rather than synthesizing one.
 pub fn ack(cmd: Command, in_pkg: &Package) -> Package {
-    let mut header = Header::new(cmd, in_pkg.header.seq.clone());
-    header.code = in_pkg.header.code;
-    header.properties = in_pkg.header.properties.clone();
+    let header = Header {
+        cmd,
+        code: in_pkg.header.code,
+        desc: None,
+        seq: in_pkg.header.seq.clone(),
+        properties: in_pkg.header.properties.clone(),
+    };
     Package {
         header,
         body: in_pkg.body.clone(),

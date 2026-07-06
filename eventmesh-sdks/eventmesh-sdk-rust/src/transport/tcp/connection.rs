@@ -177,7 +177,11 @@ impl TcpConnection {
     ///
     /// Corresponds to Java `TcpClient.io()`.
     pub async fn io(&self, pkg: Package, timeout: Duration) -> Result<Package> {
-        let seq = pkg.header.seq.clone();
+        // Client-originated frames always carry a seq (see `message::package`),
+        // so this is `Some` in practice. A `None` would mean a programming
+        // error; we coalesce it to an empty string so the `pending` lookup
+        // (keyed by `String`) stays consistent with the run loop below.
+        let seq = pkg.header.seq.clone().unwrap_or_default();
         let (tx, rx) = oneshot::channel();
 
         // Register pending context BEFORE sending so the read loop can match
@@ -308,8 +312,13 @@ impl TcpConnection {
                                 debug!("heartbeat response received");
                                 continue;
                             }
-                            let seq = pkg.header.seq.clone();
+                            let seq = pkg.header.seq.clone().unwrap_or_default();
                             // Try to match a pending request-response context.
+                            // Server-initiated frames (GOODBYE/REDIRECT) arrive
+                            // with no seq, so `seq` is "" here and never
+                            // matches a client's random 10-char correlation key
+                            // — they fall through to the inbound channel below
+                            // so `handle_inbound` can ACK them.
                             let entry = {
                                 let mut guard = pending.lock().await;
                                 guard.remove(&seq)
@@ -447,7 +456,7 @@ mod tests {
             //    server's `org.apache.eventmesh.common.protocol.tcp.EventMeshMessage`.
             let req = framed.next().await.unwrap().unwrap();
             assert_eq!(req.header.cmd, Command::RequestToServer);
-            let seq = req.header.seq.clone();
+            let seq = req.header.seq.clone().unwrap_or_default();
             let body = PackageBody::Text(
                 serde_json::json!({
                     "topic": "reply",
@@ -473,7 +482,7 @@ mod tests {
                 match framed.next().await {
                     Some(Ok(pkg)) => {
                         if pkg.header.cmd == Command::ResponseToClientAck {
-                            got_ack = Some(pkg.header.seq.clone());
+                            got_ack = Some(pkg.header.seq.clone().unwrap_or_default());
                             break;
                         }
                     }

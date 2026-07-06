@@ -482,14 +482,20 @@ mod tests {
             for _ in 0..2 {
                 let req = framed.next().await.unwrap().unwrap();
                 assert_eq!(req.header.cmd, Command::SubscribeRequest);
-                let resp = Package::new(Header::new(Command::SubscribeResponse, req.header.seq));
+                let resp = Package::new(Header::new(
+                    Command::SubscribeResponse,
+                    req.header.seq.clone().unwrap_or_default(),
+                ));
                 framed.send(resp).await.unwrap();
             }
 
             // 3. Reply to the UNSUBSCRIBE_REQUEST with UnsubscribeResponse (code 0).
             let req = framed.next().await.unwrap().unwrap();
             assert_eq!(req.header.cmd, Command::UnsubscribeRequest);
-            let resp = Package::new(Header::new(Command::UnsubscribeResponse, req.header.seq));
+            let resp = Package::new(Header::new(
+                Command::UnsubscribeResponse,
+                req.header.seq.clone().unwrap_or_default(),
+            ));
             framed.send(resp).await.unwrap();
 
             // Keep the connection alive until the client drops it.

@@ -275,20 +275,32 @@ pub struct Header {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
     /// Correlation key (random 10-char string generated per request).
-    pub seq: String,
+    ///
+    /// Optional on the wire: the Java runtime sends some server-initiated
+    /// frames (`SERVER_GOODBYE_REQUEST`, `REDIRECT_TO_CLIENT`) with `seq =
+    /// null`, which `JsonUtils` omits. Treating the field as `Option<String>`
+    /// lets us decode those valid frames instead of rejecting them for a
+    /// missing required field before `handle_inbound` can ACK them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<String>,
     /// Arbitrary key-value properties (e.g. `protocol_type`).
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
 }
 
 impl Header {
-    /// Create a new header with the given command and a random seq.
+    /// Create a new header with the given command and a correlation seq.
+    ///
+    /// `seq` is stored as `Some(seq)` — client-originated frames always carry
+    /// a seq so the server can correlate the reply. Server-initiated frames
+    /// with no seq are only ever *received* (built directly on the wire by the
+    /// Java runtime), so there is no need to construct a `None`-seq header here.
     pub fn new(cmd: Command, seq: impl Into<String>) -> Self {
         Self {
             cmd,
             code: 0,
             desc: None,
-            seq: seq.into(),
+            seq: Some(seq.into()),
             properties: HashMap::new(),
         }
     }
@@ -565,5 +577,43 @@ mod tests {
             let name = cmd.name();
             assert_eq!(Command::from_name(name), Some(cmd), "{name}");
         }
+    }
+
+    /// Server-initiated frames (`SERVER_GOODBYE_REQUEST`, `REDIRECT_TO_CLIENT`)
+    /// are built by the Java runtime with `seq = null`, which Jackson omits on
+    /// the wire. We must accept those frames rather than rejecting them for a
+    /// missing required field before `handle_inbound` can send the
+    /// `SERVER_GOODBYE_RESPONSE`.
+    #[test]
+    fn accepts_missing_seq_for_server_initiated_frames() {
+        for cmd_name in ["SERVER_GOODBYE_REQUEST", "REDIRECT_TO_CLIENT"] {
+            let json = format!(r#"{{"cmd":"{cmd_name}","code":0}}"#);
+            let header: Header = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to decode {cmd_name} frame without seq: {e}"));
+            assert_eq!(header.cmd.name(), cmd_name);
+            assert_eq!(header.seq, None, "{cmd_name} seq should be absent");
+        }
+    }
+
+    /// A header with a seq still round-trips it as `Some`.
+    #[test]
+    fn present_seq_decodes_as_some_and_is_omitted_when_none() {
+        let with_seq = r#"{"cmd":"HELLO_RESPONSE","code":0,"seq":"seq-1"}"#;
+        let header: Header = serde_json::from_str(with_seq).unwrap();
+        assert_eq!(header.seq.as_deref(), Some("seq-1"));
+        // Serializing a None-seq header must omit the field (matches Java
+        // JsonUtils, which skips nulls).
+        let none_seq = Header {
+            cmd: Command::ServerGoodbyeRequest,
+            code: 0,
+            desc: None,
+            seq: None,
+            properties: HashMap::new(),
+        };
+        let json = serde_json::to_string(&none_seq).unwrap();
+        assert!(
+            !json.contains("seq"),
+            "None seq should be omitted, got: {json}"
+        );
     }
 }

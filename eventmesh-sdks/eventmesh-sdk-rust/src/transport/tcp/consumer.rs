@@ -386,12 +386,30 @@ async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
     // Parse message body and invoke listener BEFORE sending the ACK.
     if let Some(msg) = message::parse_message(&pkg.body) {
         debug!(topic = ?msg.topic, "dispatching to listener");
+        // Snapshot the request's wire properties before the listener
+        // consumes the message. When the listener returns a fresh reply we
+        // merge these back in so the broker can correlate the reply with the
+        // original request — RocketMQ reply-to / correlation-id and similar
+        // extensions ride in `props`, and a hand-built reply drops them,
+        // causing `RESPONSE_TO_SERVER` to be unmatchable and
+        // `TcpProducer::request_reply` to time out. The gRPC consumer does
+        // the same merge in `build_reply`.
+        let request_props = msg.props.clone();
         // Listener may return a reply (for REQUEST_TO_CLIENT). The Java SDK
         // sends RESPONSE_TO_SERVER inside the callback, before the ACK.
         // Guard against a panicking listener so it cannot kill the receive
         // loop (which would stall the inbound channel and freeze heartbeats).
         match AssertUnwindSafe(listener.handle(msg)).catch_unwind().await {
-            Ok(Some(reply)) => {
+            Ok(Some(mut reply)) => {
+                // Carry the request's correlation metadata into the reply;
+                // the reply's own values take precedence (mirrors gRPC
+                // `build_reply`'s `or_insert_with` semantics).
+                for (key, value) in &request_props {
+                    reply
+                        .props
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
                 match message::build_message_package(&reply, Command::ResponseToServer) {
                     Ok(reply_pkg) => {
                         if let Err(e) = conn.send(reply_pkg).await {

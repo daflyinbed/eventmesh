@@ -29,7 +29,7 @@ use crate::harness::{
     ensure_topic, let_stream_settle, tcp_consumer_config, tcp_producer_config, unique_topic,
     ReplyingListener,
 };
-use crate::runtime::ensure_runtime;
+use crate::runtime::{ensure_runtime, mode, Mode};
 
 const REPLY: &str = "pong";
 
@@ -74,11 +74,14 @@ async fn tcp_request_reply_roundtrip() {
     producer.shutdown().await;
     consumer.shutdown().await;
 
-    // The standalone (in-memory) broker does not implement synchronous
-    // request/reply — it may reject the request. Treat that specific
-    // broker-capability gap as a skip, not a failure, so the suite stays green
-    // on standalone while still asserting the full round-trip on a durable
-    // backend (RocketMQ).
+    // The harness itself always starts the `rocketmq` profile, where sync
+    // request/reply is expected to work. Only an externally-provided server
+    // (set via `EVENTMESH_E2E_EXTERNAL=1` or pre-started by the user) can be
+    // the standalone (in-memory) broker, which does not implement RR. So fail
+    // on any error when we launched the stack, and only skip for the
+    // standalone case on an external server — a timeout, codec regression,
+    // bad ACK, or connection failure must surface instead of being silently
+    // swallowed as a skip.
     match reply {
         Ok(reply) => {
             assert_eq!(
@@ -87,11 +90,19 @@ async fn tcp_request_reply_roundtrip() {
                 "reply content mismatch: {reply}"
             );
         }
-        Err(e) => {
-            eprintln!(
-                "[e2e] skipping tcp_request_reply assertion: broker may not support \
-                 sync request/reply (standalone). error: {e}"
-            );
-        }
+        Err(e) => match mode() {
+            Some(Mode::Started) => {
+                panic!(
+                    "tcp request/reply failed on the harness-launched (rocketmq) \
+                     broker, where it is expected to work: {e}"
+                );
+            }
+            _ => {
+                eprintln!(
+                    "[e2e] skipping tcp_request_reply assertion: externally-provided \
+                     server may not support sync request/reply (standalone). error: {e}"
+                );
+            }
+        },
     }
 }

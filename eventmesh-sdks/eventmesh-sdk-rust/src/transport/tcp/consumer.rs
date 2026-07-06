@@ -173,9 +173,29 @@ impl<L: MessageListener<Message = EventMeshMessage>> Subscriber for TcpConsumer<
 
         if response.is_success() {
             let mut subs = self.subscriptions.lock().await;
-            for item in &items {
-                subs.retain(|s| s.topic != item.topic);
+            // The runtime's TCP `UnSubscribeProcessor` ignores the request
+            // body and unsubscribes **every** topic in the session (it reads
+            // `session.getSessionContext().getSubscribeTopics()` and removes
+            // them all). This mirrors the Java SDK, whose
+            // `MessageUtils.unsubscribe()` sends an `UNSUBSCRIBE_REQUEST` with
+            // no body. So a successful response means the whole subscription
+            // set is gone on the server regardless of which topics the caller
+            // passed — clear the local map entirely to stay consistent. The
+            // `Subscriber` trait signature is shared with gRPC/HTTP, which do
+            // support per-topic unsubscribe, so we keep accepting `items` but
+            // warn when the caller tried to narrow the scope.
+            let current: Vec<String> = subs.iter().map(|s| s.topic.clone()).collect();
+            let passed_all =
+                items.len() == current.len() && items.iter().all(|i| current.contains(&i.topic));
+            if !passed_all {
+                warn!(
+                    passed = ?items.iter().map(|i| i.topic.clone()).collect::<Vec<_>>(),
+                    current = ?current,
+                    "TCP unsubscribe drops ALL topics on the server (not just \
+                     the ones passed); clearing local state to match"
+                );
             }
+            subs.clear();
         }
         Ok(response)
     }
@@ -394,5 +414,115 @@ async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
         if let Err(e) = conn.send(ack_pkg).await {
             warn!(error = %e, "failed to send ACK");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::TcpClientConfig;
+    use crate::model::{SubscriptionItem, SubscriptionMode, SubscriptionType};
+    use crate::transport::tcp::codec::TcpCodec;
+    use crate::transport::tcp::frame::{Command, Header, Package};
+
+    use futures::SinkExt;
+    use tokio::net::TcpListener;
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::Framed;
+
+    /// A no-op listener used only to satisfy `TcpConsumer`'s type parameter.
+    struct NoopListener;
+    impl MessageListener for NoopListener {
+        type Message = EventMeshMessage;
+        async fn handle(&self, _: EventMeshMessage) -> Option<EventMeshMessage> {
+            None
+        }
+    }
+
+    /// Loopback test: the runtime's TCP `UnSubscribeProcessor` ignores the
+    /// request body and drops **all** session topics. After subscribing to A
+    /// and B and calling `unsubscribe([A])`, the local `subscriptions` map
+    /// must be empty (not just missing A) so it matches the server.
+    #[tokio::test]
+    async fn unsubscribe_clears_all_local_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, TcpCodec::new());
+
+            // 1. HELLO handshake.
+            let hello = framed.next().await.unwrap().unwrap();
+            assert_eq!(hello.header.cmd, Command::HelloRequest);
+            let hello_resp = Package::new(Header::new(Command::HelloResponse, "hello-seq"));
+            framed.send(hello_resp).await.unwrap();
+
+            // 2. Reply to each SUBSCRIBE_REQUEST with SubscribeResponse (code 0).
+            for _ in 0..2 {
+                let req = framed.next().await.unwrap().unwrap();
+                assert_eq!(req.header.cmd, Command::SubscribeRequest);
+                let resp = Package::new(Header::new(Command::SubscribeResponse, req.header.seq));
+                framed.send(resp).await.unwrap();
+            }
+
+            // 3. Reply to the UNSUBSCRIBE_REQUEST with UnsubscribeResponse (code 0).
+            let req = framed.next().await.unwrap().unwrap();
+            assert_eq!(req.header.cmd, Command::UnsubscribeRequest);
+            let resp = Package::new(Header::new(Command::UnsubscribeResponse, req.header.seq));
+            framed.send(resp).await.unwrap();
+
+            // Keep the connection alive until the client drops it.
+            let _ = framed.close().await;
+        });
+
+        let config = TcpClientConfig::builder()
+            .server_addr("127.0.0.1")
+            .server_port(port)
+            .consumer_group("g")
+            .timeout(Duration::from_secs(3))
+            .heartbeat_interval(Duration::from_secs(60))
+            .build();
+
+        let consumer = TcpConsumer::connect(config, NoopListener)
+            .await
+            .expect("connect");
+
+        // Subscribe to two topics via `add_subscription` (avoids spawning the
+        // listen/receive loop). Each call records into `self.subscriptions`.
+        let item_a =
+            SubscriptionItem::new("A", SubscriptionMode::CLUSTERING, SubscriptionType::SYNC);
+        let item_b =
+            SubscriptionItem::new("B", SubscriptionMode::CLUSTERING, SubscriptionType::SYNC);
+        consumer
+            .add_subscription(&[item_a, item_b])
+            .await
+            .expect("subscribe A+B");
+        {
+            let subs = consumer.subscriptions.lock().await;
+            assert_eq!(subs.len(), 2, "both subscriptions should be recorded");
+        }
+
+        // Unsubscribe only A. The server drops ALL topics, so the local map
+        // must be fully cleared — not left with a phantom B entry.
+        let item_a =
+            SubscriptionItem::new("A", SubscriptionMode::CLUSTERING, SubscriptionType::SYNC);
+        consumer
+            .unsubscribe(vec![item_a])
+            .await
+            .expect("unsubscribe A");
+        {
+            let subs = consumer.subscriptions.lock().await;
+            assert!(
+                subs.is_empty(),
+                "local subscriptions must be fully cleared after unsubscribe, got: {:?}",
+                *subs
+            );
+        }
+
+        consumer.shutdown().await;
+        let _ = server.await;
     }
 }

@@ -22,7 +22,6 @@
 //! via a `seq`-keyed pending map of `oneshot` channels.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,12 +87,15 @@ impl TcpConnection {
         heartbeat_interval: Duration,
         timeout: Duration,
     ) -> Result<Self> {
-        let socket_addr: SocketAddr = format!("{addr}:{port}")
-            .parse()
-            .map_err(|e| EventMeshError::InvalidArgument(format!("invalid addr: {e}")))?;
-
-        debug!(%socket_addr, "connecting TCP");
-        let stream = tokio::time::timeout(timeout, TcpStream::connect(socket_addr))
+        // Defer name resolution to Tokio: `TcpStream::connect` accepts a
+        // "host:port" string via `ToSocketAddrs`, so DNS names like
+        // "localhost" (the default `server_addr`) resolve correctly.
+        // Pre-parsing into a `SocketAddr` would reject any non-numeric host
+        // with `InvalidArgument` before the resolver ever runs, breaking the
+        // default config and any hostname-based deployment.
+        let peer = format!("{addr}:{port}");
+        debug!(%peer, "connecting TCP");
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(&peer))
             .await
             .map_err(|_| EventMeshError::Timeout(timeout))??;
         stream.set_nodelay(true).ok();
@@ -158,7 +160,7 @@ impl TcpConnection {
             Arc::clone(&alive),
         ));
 
-        info!(%socket_addr, "TCP connected");
+        info!(%peer, "TCP connected");
 
         Ok(Self {
             outbound_tx,

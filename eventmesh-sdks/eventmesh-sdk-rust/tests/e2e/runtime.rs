@@ -50,7 +50,7 @@ pub(crate) const HOST: &str = "127.0.0.1";
 static TEARDOWN_NEEDED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     /// A server was already reachable (or `EVENTMESH_E2E_EXTERNAL` set); we did
     /// not start anything.
     External,
@@ -117,6 +117,17 @@ pub(crate) fn webhook_host() -> String {
         Some(&Mode::Started | &Mode::External) => "host.docker.internal".to_string(),
         _ => "127.0.0.1".to_string(),
     }
+}
+
+/// The resolved runtime mode, or `None` before [`ensure_runtime`] has been
+/// called.
+///
+/// Tests use this to distinguish the harness-launched broker (always the
+/// `rocketmq` profile, where every feature is expected to work) from an
+/// externally-provided server (which may be the feature-limited standalone
+/// broker).
+pub(crate) fn mode() -> Option<Mode> {
+    MODE.get().copied()
 }
 
 fn initialize() -> Mode {

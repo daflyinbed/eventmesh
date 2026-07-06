@@ -449,10 +449,19 @@ impl Subscription {
 }
 
 /// Body for `REDIRECT_TO_CLIENT`.
+///
+/// Mirrors `org.apache.eventmesh.common.protocol.tcp.RedirectInfo`, whose
+/// fields are `ip` (String) and `port` (int). The runtime emits this in
+/// `EventMeshTcp2Client.redirectClient2NewEventMesh` to tell the client which
+/// EventMesh node to reconnect to during a rebalance. The previous shape only
+/// had a defaulted `redirect_to`, which serde silently discarded the target
+/// address for, making any redirect handling impossible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedirectInfo {
     #[serde(default)]
-    pub redirect_to: String,
+    pub ip: String,
+    #[serde(default)]
+    pub port: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -615,5 +624,42 @@ mod tests {
             !json.contains("seq"),
             "None seq should be omitted, got: {json}"
         );
+    }
+
+    /// `RedirectInfo` must carry `ip`/`port` (the Java
+    /// `org.apache.eventmesh.common.protocol.tcp.RedirectInfo` wire shape), not
+    /// a synthetic `redirect_to`. The runtime serializes it via Jackson with
+    /// these exact field names; any other shape would make serde silently drop
+    /// the redirect target on decode.
+    #[test]
+    fn redirect_info_round_trips_java_wire_shape() {
+        let java_json = r#"{"ip":"10.0.0.5","port":10000}"#;
+        let ri: RedirectInfo = serde_json::from_str(java_json).expect("decode RedirectInfo");
+        assert_eq!(ri.ip, "10.0.0.5");
+        assert_eq!(ri.port, 10000);
+
+        // Re-serialize and ensure the field names match the Java wire format.
+        let out = serde_json::to_string(&ri).unwrap();
+        assert!(
+            out.contains("\"ip\":\"10.0.0.5\""),
+            "expected ip field on the wire, got: {out}"
+        );
+        assert!(
+            out.contains("\"port\":10000"),
+            "expected port field on the wire, got: {out}"
+        );
+        assert!(
+            !out.contains("redirect_to"),
+            "must NOT emit a redirect_to field, got: {out}"
+        );
+    }
+
+    /// Missing `ip`/`port` default (mirrors Jackson populating `null`/`0` for
+    /// an absent field rather than rejecting the frame).
+    #[test]
+    fn redirect_info_defaults_missing_fields() {
+        let ri: RedirectInfo = serde_json::from_str("{}").expect("decode empty RedirectInfo");
+        assert_eq!(ri.ip, "");
+        assert_eq!(ri.port, 0);
     }
 }

@@ -31,7 +31,7 @@ use crate::config::TcpClientConfig;
 use crate::error::{EventMeshError, Result};
 use crate::model::{EventMeshMessage, PublishResponse, SubscriptionItem};
 use crate::transport::tcp::connection::TcpConnection;
-use crate::transport::tcp::frame::{Command, Package, UserAgent};
+use crate::transport::tcp::frame::{Command, Package, PackageBody, UserAgent};
 use crate::transport::tcp::message;
 use crate::transport::Subscriber;
 use crate::MessageListener;
@@ -326,7 +326,10 @@ impl<L: MessageListener<Message = EventMeshMessage>> IntoFuture for ListenServe<
                     pkg = inbound_rx.recv() => {
                         match pkg {
                             Some(pkg) => {
-                                handle_inbound(&pkg, &conn, &*listener).await;
+                                if !handle_inbound(&pkg, &conn, &*listener).await {
+                                    info!("receive loop stopping after REDIRECT_TO_CLIENT");
+                                    break;
+                                }
                             }
                             None => {
                                 info!("inbound channel closed, exiting receive loop");
@@ -353,11 +356,18 @@ impl<L: MessageListener<Message = EventMeshMessage>> IntoFuture for ListenServe<
 /// `callback(getProtocolMessage(msg), ctx); response(ack)` flow. This means
 /// at-least-once redelivery applies to crashes *between* the listener returning
 /// and the ACK being written, not to client-side parse failures.
+///
+/// Returns `true` to keep the receive loop running, or `false` to stop it. The
+/// only case that returns `false` is `REDIRECT_TO_CLIENT`: the runtime has
+/// advertised a new node and will unconditionally close this session after a
+/// 30s grace period (`closeSessionIfTimeout`), so stopping the loop lets the
+/// caller reconnect immediately instead of stalling until the forced
+/// disconnect.
 async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
     pkg: &Package,
     conn: &TcpConnection,
     listener: &L,
-) {
+) -> bool {
     let ack_cmd = match pkg.header.cmd {
         Command::RequestToClient => Some(Command::RequestToClientAck),
         Command::AsyncMessageToClient => Some(Command::AsyncMessageToClientAck),
@@ -375,11 +385,40 @@ async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
             if let Err(e) = conn.send(resp).await {
                 warn!(error = %e, "failed to send SERVER_GOODBYE_RESPONSE");
             }
-            return;
+            return true;
+        }
+        Command::RedirectToClient => {
+            // The runtime sends REDIRECT_TO_CLIENT during rebalance (body =
+            // RedirectInfo{ip,port}), then closes this session after a 30s
+            // grace period regardless of the client's reaction. There is no
+            // ACK for this command. Surface the advertised target and stop the
+            // receive loop now so the caller can reconnect to it instead of
+            // waiting for the forced disconnect, which would freeze delivery
+            // for up to 30s.
+            match pkg.body {
+                PackageBody::RedirectInfo(ref ri) => {
+                    info!(
+                        ip = %ri.ip,
+                        port = ri.port,
+                        "received REDIRECT_TO_CLIENT; stopping receive loop so the \
+                         caller can reconnect to the advertised EventMesh node"
+                    );
+                }
+                PackageBody::Text(ref s) => warn!(
+                    body = %s,
+                    "REDIRECT_TO_CLIENT body did not deserialize into RedirectInfo; \
+                     stopping receive loop"
+                ),
+                ref other => warn!(
+                    body = ?other,
+                    "unexpected body shape for REDIRECT_TO_CLIENT; stopping receive loop"
+                ),
+            }
+            return false;
         }
         cmd => {
             warn!(?cmd, "unexpected inbound command, ignoring");
-            return;
+            return true;
         }
     };
 
@@ -433,6 +472,8 @@ async fn handle_inbound<L: MessageListener<Message = EventMeshMessage>>(
             warn!(error = %e, "failed to send ACK");
         }
     }
+
+    true
 }
 
 #[cfg(test)]
@@ -443,7 +484,7 @@ mod tests {
     use crate::config::TcpClientConfig;
     use crate::model::{SubscriptionItem, SubscriptionMode, SubscriptionType};
     use crate::transport::tcp::codec::TcpCodec;
-    use crate::transport::tcp::frame::{Command, Header, Package};
+    use crate::transport::tcp::frame::{Command, Header, Package, PackageBody, RedirectInfo};
 
     use futures::SinkExt;
     use tokio::net::TcpListener;
@@ -545,6 +586,98 @@ mod tests {
                 *subs
             );
         }
+
+        consumer.shutdown().await;
+        let _ = server.await;
+    }
+
+    /// On rebalance the runtime sends `REDIRECT_TO_CLIENT` with an
+    /// `ip`/`port` body, then closes the session after a 30s grace period.
+    /// The receive loop must not ignore the frame (the old behavior silently
+    /// dropped it and froze delivery until the forced disconnect); it should
+    /// stop the loop promptly so the caller can reconnect to the advertised
+    /// node. This loopback test drives the full codec path: the fake server
+    /// sends a wire-format `REDIRECT_TO_CLIENT` frame and we assert that
+    /// `ListenServe` resolves on its own (no external shutdown needed).
+    #[tokio::test]
+    async fn redirect_to_client_stops_receive_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, TcpCodec::new());
+
+            // 1. HELLO handshake.
+            let hello = framed.next().await.unwrap().unwrap();
+            assert_eq!(hello.header.cmd, Command::HelloRequest);
+            framed
+                .send(Package::new(Header::new(
+                    Command::HelloResponse,
+                    "hello-seq",
+                )))
+                .await
+                .unwrap();
+
+            // 2. Reply to SUBSCRIBE_REQUEST.
+            let req = framed.next().await.unwrap().unwrap();
+            assert_eq!(req.header.cmd, Command::SubscribeRequest);
+            framed
+                .send(Package::new(Header::new(
+                    Command::SubscribeResponse,
+                    req.header.seq.clone().unwrap_or_default(),
+                )))
+                .await
+                .unwrap();
+
+            // 3. Reply to LISTEN_REQUEST.
+            let req = framed.next().await.unwrap().unwrap();
+            assert_eq!(req.header.cmd, Command::ListenRequest);
+            framed
+                .send(Package::new(Header::new(
+                    Command::ListenResponse,
+                    req.header.seq.clone().unwrap_or_default(),
+                )))
+                .await
+                .unwrap();
+
+            // 4. Send REDIRECT_TO_CLIENT with a wire-format RedirectInfo body,
+            //    exactly as EventMeshTcp2Client.redirectClient2NewEventMesh
+            //    does (seq = null, body = {"ip":..,"port":..}).
+            let redirect = Package::new(Header::new(Command::RedirectToClient, "redirect-seq"))
+                .with_body(PackageBody::RedirectInfo(RedirectInfo {
+                    ip: "10.0.0.9".into(),
+                    port: 10000,
+                }));
+            framed.send(redirect).await.unwrap();
+
+            let _ = framed.close().await;
+        });
+
+        let config = TcpClientConfig::builder()
+            .server_addr("127.0.0.1")
+            .server_port(port)
+            .consumer_group("g")
+            .timeout(Duration::from_secs(3))
+            .heartbeat_interval(Duration::from_secs(60))
+            .build();
+
+        let consumer = TcpConsumer::connect(config, NoopListener)
+            .await
+            .expect("connect");
+
+        let item = SubscriptionItem::new("A", SubscriptionMode::CLUSTERING, SubscriptionType::SYNC);
+        let serve = consumer.listen(vec![item]).expect("listen");
+
+        // The redirect frame should make the driver resolve on its own, without
+        // the user triggering a graceful shutdown. A 30s hang here is the
+        // failure mode this test guards against.
+        let result = tokio::time::timeout(Duration::from_secs(10), serve).await;
+        assert!(
+            result.is_ok(),
+            "REDIRECT_TO_CLIENT should stop the receive loop promptly"
+        );
+        result.unwrap().expect("driver should exit cleanly");
 
         consumer.shutdown().await;
         let _ = server.await;
